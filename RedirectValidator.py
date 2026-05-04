@@ -6,11 +6,13 @@ import time
 import urllib3
 import concurrent.futures
 import re
-import ssl
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 st.set_page_config(page_title="Redirect Validator", page_icon="🔗", layout="wide")
+
+# ---------------- UI ---------------- #
+st.title("Redirect Validator 🚀")
 
 # ---------------- HELPERS ---------------- #
 
@@ -31,12 +33,12 @@ def safe_extract_text(response):
 def is_html_response(response):
     return 'text/html' in response.headers.get('Content-Type', '').lower()
 
-# ---------------- SSL CLASSIFIER (NEW 🔥) ---------------- #
+# ---------------- SSL CLASSIFICATION ---------------- #
 
 def classify_ssl_error(e):
     msg = str(e).lower()
 
-    if "certificate has expired" in msg:
+    if "expired" in msg:
         return "🔒 SSL EXPIRED", "Certificate expired"
 
     if "hostname" in msg or "doesn't match" in msg:
@@ -45,33 +47,33 @@ def classify_ssl_error(e):
     if "self signed" in msg:
         return "⚠️ SELF SIGNED", "Self-signed certificate"
 
-    if "certificate verify failed" in msg:
-        return "🔒 SSL FAILED", "Verification failed"
+    if "verify failed" in msg:
+        return "🔒 SSL FAILED", "Certificate verify failed"
 
     return "🔒 NOT SECURE", "Unknown SSL issue"
 
 # ---------------- REQUEST ---------------- #
 
-def make_request(url, max_retries):
+def make_request(url, retries=3):
     target_url = str(url).strip()
+
     if not target_url.startswith(('http://', 'https://')):
         target_url = 'http://' + target_url
 
     headers = {
         'User-Agent': 'Mozilla/5.0',
         'Accept': 'text/html',
-        'Accept-Encoding': 'identity',  # critical fix
-        'Connection': 'keep-alive'
+        'Accept-Encoding': 'identity',  # IMPORTANT FIX
     }
 
     last_err = None
 
-    for _ in range(max_retries):
+    for _ in range(retries):
         try:
             return requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
         except requests.exceptions.SSLError as e:
             raise e
-        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+        except Exception as e:
             last_err = e
             time.sleep(1)
 
@@ -104,23 +106,22 @@ def check_safe_browsing(url, api_key):
 
     return None
 
-# ---------------- CORE LOGIC ---------------- #
+# ---------------- CORE ---------------- #
 
-def check_redirect(source, expected_target, api_key=None, max_retries=3):
+def check_redirect(source, expected, api_key=None, retries=3):
 
-    core_source = clean_url_logic(source)
-    core_expected = clean_url_logic(expected_target)
+    core_expected = clean_url_logic(expected)
 
     result = {
         "Source Domain": source,
-        "Expected Target": expected_target,
+        "Expected Target": expected,
         "Actual Final URL": "-",
         "Status": "",
         "Details": "",
         "Page Output": ""
     }
 
-    # Safe browsing (source)
+    # Safe Browsing (source)
     threat = check_safe_browsing(source, api_key)
     if threat:
         result["Status"] = "🚨 DANGEROUS"
@@ -128,18 +129,21 @@ def check_redirect(source, expected_target, api_key=None, max_retries=3):
         return result
 
     try:
-        response = make_request(source, max_retries)
+        response = make_request(source, retries)
+
         final_url = response.url
         result["Actual Final URL"] = final_url
 
+        # Extract content safely
         if is_html_response(response):
-            result["Page Output"] = safe_extract_text(response)
+            content = safe_extract_text(response)
+            result["Page Output"] = content if content.strip() else "Empty page"
         else:
             result["Page Output"] = "Non-HTML content"
 
         core_actual = clean_url_logic(final_url)
 
-        # Safe browsing (final)
+        # Safe Browsing (final)
         threat = check_safe_browsing(final_url, api_key)
         if threat:
             result["Status"] = "🚨 DANGEROUS"
@@ -161,7 +165,7 @@ def check_redirect(source, expected_target, api_key=None, max_retries=3):
 
     except requests.exceptions.ConnectionError:
         result["Status"] = "🚫 DOWN"
-        result["Details"] = "DNS/Server error"
+        result["Details"] = "Server unreachable"
 
     except requests.exceptions.Timeout:
         result["Status"] = "⏱️ TIMEOUT"
@@ -173,7 +177,7 @@ def check_redirect(source, expected_target, api_key=None, max_retries=3):
 
     return result
 
-# ---------------- EXCEL FIX ---------------- #
+# ---------------- EXCEL ---------------- #
 
 def sanitize_for_excel(val):
     if isinstance(val, str):
@@ -189,23 +193,29 @@ def convert_df_to_excel(df):
 
     return buffer.getvalue()
 
-# ---------------- UI ---------------- #
+# ---------------- MAIN ---------------- #
 
-st.title("Redirect Validator 🚀")
-
-file = st.file_uploader("Upload Excel", type=["xlsx"])
+file = st.file_uploader("Upload Excel File", type=["xlsx"])
 
 if file:
-    if st.button("Start Validation"):
+    if st.button("🚀 Start Validation"):
 
         df = pd.read_excel(file)
+
+        # CLEAN COLUMN NAMES
+        df.columns = df.columns.str.strip()
+
+        # AUTO DETECT COLUMNS
+        source_col = next(c for c in df.columns if 'source' in c.lower() or 'domain' in c.lower())
+        target_col = next(c for c in df.columns if 'target' in c.lower() or 'web' in c.lower())
 
         results = []
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
             futures = [
-                executor.submit(check_redirect, row[0], row[1])
+                executor.submit(check_redirect, row[source_col], row[target_col])
                 for _, row in df.iterrows()
+                if not pd.isna(row[source_col])
             ]
 
             for f in futures:
@@ -216,7 +226,7 @@ if file:
         st.dataframe(df_res, use_container_width=True)
 
         st.download_button(
-            "Download Report",
+            "📥 Download Report",
             convert_df_to_excel(df_res),
             "redirect_report.xlsx"
         )
