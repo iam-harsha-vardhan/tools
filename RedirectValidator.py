@@ -5,6 +5,10 @@ import io
 import time
 import urllib3
 import concurrent.futures
+import re
+
+# 1. Hide "Insecure Request" warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Page Config ---
 st.set_page_config(page_title="Redirect Validator", page_icon="🔗", layout="wide")
@@ -46,8 +50,8 @@ def clean_url_logic(url):
     if u.startswith("www."): u = u[4:]
     return u.rstrip('/')
 
-def make_request(url):
-    """Tries to connect with REAL BROWSER HEADERS. STRICT SSL IS ENFORCED."""
+def make_request(url, max_retries):
+    """Tries to connect with REAL BROWSER HEADERS, enforcing retries for failed pages."""
     target_url = str(url).strip()
     if not target_url.startswith(('http://', 'https://')):
         target_url = 'http://' + target_url 
@@ -61,32 +65,36 @@ def make_request(url):
         'Upgrade-Insecure-Requests': '1'
     }
     
-    try:
-        # Default behavior enforces SSL validation (verify=True)
-        response = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
-        return response
-    except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout):
+    last_err = None
+    
+    # Retry Loop Logic
+    for attempt in range(max_retries):
         try:
-            if target_url.startswith("http://"):
-                retry_url = target_url.replace("http://", "https://", 1)
-            else:
-                retry_url = target_url.replace("https://", "http://", 1)
-            response = requests.get(retry_url, headers=headers, allow_redirects=True, timeout=10)
+            response = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
             return response
-        except Exception as e:
-            raise e
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+            last_err = e
+            time.sleep(1) # Wait 1 second before retrying
+            
+    # If standard attempts fail, try a protocol swap as a last resort
+    try:
+        if target_url.startswith("http://"):
+            retry_url = target_url.replace("http://", "https://", 1)
+        else:
+            retry_url = target_url.replace("https://", "http://", 1)
+        response = requests.get(retry_url, headers=headers, allow_redirects=True, timeout=10)
+        return response
+    except Exception:
+        raise last_err # Raise the original error if the fallback fails
 
 def check_safe_browsing(url, api_key):
-    """Queries the Google Safe Browsing API to see if the site is dangerous/phishing."""
+    """Queries the Google Safe Browsing API to see if the site is dangerous and returns the specific threat type."""
     if not api_key:
-        return False
+        return None
         
     api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}"
     payload = {
-        "client": {
-            "clientId": "redirect-validator",
-            "clientVersion": "1.0"
-        },
+        "client": {"clientId": "redirect-validator", "clientVersion": "1.0"},
         "threatInfo": {
             "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE", "POTENTIALLY_HARMFUL_APPLICATION"],
             "platformTypes": ["ANY_PLATFORM"],
@@ -99,20 +107,21 @@ def check_safe_browsing(url, api_key):
         resp = requests.post(api_url, json=payload, timeout=5)
         if resp.status_code == 200:
             data = resp.json()
-            if "matches" in data:
-                return True
+            if "matches" in data and len(data["matches"]) > 0:
+                # Return the exact threat type (e.g., 'SOCIAL_ENGINEERING' or 'MALWARE')
+                return data["matches"][0].get("threatType", "UNKNOWN_THREAT")
     except Exception:
         pass
-    
-    return False
+    return None
 
-def check_redirect(source, expected_target, google_api_key=None):
+def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
     if expected_target and "httpts" in str(expected_target):
         return {
             "Source Domain": source, "Expected Target": expected_target,
-            "Actual Final URL": "-", "Status": "❗ TYPO", "Details": "Fix 'httpts' in Excel", "Page Output": "N/A"
+            "Actual Final URL": "-", "Status": "❌ BROKEN", "Details": "Fix 'httpts' in Excel", "Page Output": "N/A"
         }
 
+    core_source = clean_url_logic(source)
     core_expected = clean_url_logic(expected_target)
     
     result = {
@@ -121,25 +130,39 @@ def check_redirect(source, expected_target, google_api_key=None):
     }
     
     try:
-        response = make_request(source)
+        response = make_request(source, max_retries)
         final_url = response.url
         result["Actual Final URL"] = final_url
         
         page_content = response.text[:1000] if response.text else "No content returned."
         result["Page Output"] = page_content
         
+        core_actual = clean_url_logic(final_url)
+
+        # --- BLANK PAGE REDIRECTION LOGIC (Domain just goes to itself) ---
+        if core_expected != core_source and core_actual == core_source:
+            result["Status"] = "❌ MISMATCH"
+            result["Details"] = "Blank page redirection"
+            return result
+
         # --- GOOGLE SAFE BROWSING CHECK ---
         if google_api_key:
-            is_dangerous = check_safe_browsing(final_url, google_api_key)
-            if is_dangerous:
-                result["Status"] = "🚨 DANGEROUS"
-                result["Details"] = "Google Safe Browsing: Deceptive Site"
-                result["Page Output"] = "Site blocked by Google. Warning: Phishing or Malware."
+            threat_type = check_safe_browsing(final_url, google_api_key)
+            if threat_type:
+                if threat_type == "SOCIAL_ENGINEERING":
+                    result["Status"] = "🚨 DECEPTIVE"
+                    result["Details"] = "Google Warning: Phishing/Social Engineering"
+                elif threat_type in ["MALWARE", "POTENTIALLY_HARMFUL_APPLICATION", "UNWANTED_SOFTWARE"]:
+                    result["Status"] = "🚨 HARMFUL"
+                    result["Details"] = "Google Warning: Malware/Harmful Programs"
+                else:
+                    result["Status"] = "🚨 DANGEROUS"
+                    result["Details"] = f"Google Warning: {threat_type}"
+                
+                result["Page Output"] = f"Site blocked by Google. Threat type identified: {threat_type}"
                 return result
                 
-        # --- COMPARISON LOGIC ---
-        core_actual = clean_url_logic(final_url)
-        
+        # --- STANDARD COMPARISON LOGIC ---
         if core_expected == core_actual:
             result["Status"] = "✅ MATCH"
             result["Details"] = "OK"
@@ -161,6 +184,14 @@ def check_redirect(source, expected_target, google_api_key=None):
                 result["Status"] = "❌ MISMATCH"
                 result["Details"] = "Redirected to wrong site"
 
+    except requests.exceptions.InvalidSchema as e:
+        result["Status"] = "❌ BROKEN"
+        result["Details"] = "Redirects to invalid URL (Typo)"
+        result["Page Output"] = f"Invalid Schema Error: {str(e)}"
+    except requests.exceptions.MissingSchema as e:
+        result["Status"] = "❌ BROKEN"
+        result["Details"] = "Redirects to broken URL"
+        result["Page Output"] = f"Missing Schema Error: {str(e)}"
     except requests.exceptions.SSLError as ssl_err:
         result["Status"] = "🔒 NOT SECURE"
         result["Details"] = "Invalid/Missing SSL Certificate"
@@ -175,7 +206,7 @@ def check_redirect(source, expected_target, google_api_key=None):
         result["Page Output"] = "Request Timed Out."
     except Exception as e:
         result["Status"] = "❗ ERROR"
-        result["Details"] = "Check output"
+        result["Details"] = "Connection Failed"
         result["Page Output"] = str(e)
         
     return result
@@ -184,18 +215,33 @@ def process_single_row(row_data):
     src = row_data['src']
     tgt = row_data['tgt']
     api_key = row_data.get('api_key')
+    retries = row_data.get('max_retries', 3)
     
     if pd.isna(tgt) or str(tgt).strip() == "":
         return {
             "Source Domain": src, "Status": "⚠️ NO TARGET", 
             "Actual Final URL": "-", "Details": "No target in rules sheet", "Page Output": "N/A"
         }
-    return check_redirect(src, tgt, api_key)
+    return check_redirect(src, tgt, api_key, retries)
+
+def sanitize_for_excel(val):
+    """Removes control characters that cause 'cannot be used in worksheets' errors."""
+    if isinstance(val, str):
+        # Strip ASCII control characters 0-8, 11-12, 14-31
+        return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', val)
+    return val
 
 def convert_df_to_excel(df):
     buffer = io.BytesIO()
+    
+    # Clean the dataframe of illegal Excel characters before exporting
+    clean_df = df.copy()
+    for col in clean_df.columns:
+        if clean_df[col].dtype == object:
+            clean_df[col] = clean_df[col].apply(sanitize_for_excel)
+            
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
+        clean_df.to_excel(writer, index=False)
     return buffer.getvalue()
 
 def generate_sample_file():
@@ -203,6 +249,8 @@ def generate_sample_file():
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         pd.DataFrame({'Feed Name': ['ExampleFeed'], 'Target Website': ['arise-cash.com']}).to_excel(writer, sheet_name='Target_Rules', index=False)
         pd.DataFrame({'Feed Name': ['ExampleFeed'], 'Source Domain': ['arisefinancepro.com']}).to_excel(writer, sheet_name='Source_Domains', index=False)
+        # Added the 3rd sheet for the API Key
+        pd.DataFrame({'Google Safe Browsing API Key': ['PASTE_YOUR_API_KEY_HERE']}).to_excel(writer, sheet_name='API_Settings', index=False)
     return output.getvalue()
 
 # --- Main App ---
@@ -210,15 +258,16 @@ def generate_sample_file():
 st.title("Redirect Validator 🚀")
 
 with st.sidebar:
-    st.header("Actions")
+    st.header("Settings & Actions")
     st.download_button("📥 Download Template", generate_sample_file(), "redirect_template.xlsx")
     
     st.markdown("---")
-    st.header("Security Integrations")
-    google_api_key = st.text_input("Google Safe Browsing API Key (Optional)", type="password", help="Leave empty to skip Phishing/Malware checks. Get a free key from Google Cloud Console.")
+    # Added UI control for Max Retries
+    max_retries_input = st.number_input("Max Retries for Timeouts/Errors", min_value=1, max_value=10, value=3, help="How many times to retry a domain if the server drops the connection.")
     
     st.markdown("---")
-    st.info("**Security Note:**\nThis uses Strict SSL checking. It flags 'Not Secure' sites as '🔒 NOT SECURE'. If API key is provided, it catches 'Deceptive Site Ahead'.")
+    st.header("Security Integrations")
+    ui_api_key = st.text_input("Google API Key (Optional)", type="password", help="If you don't add the API Key in the 3rd sheet of the Excel file, you can paste it here.")
 
 uploaded_file = st.file_uploader("Upload Excel File", type=['xlsx', 'xls'])
 
@@ -231,12 +280,38 @@ if uploaded_file:
         try:
             xls = pd.ExcelFile(uploaded_file)
             all_sheets = xls.sheet_names
+            
+            # Identify the primary sheets
             sheet_rules = next((s for s in all_sheets if 'target' in s.lower() or 'rule' in s.lower()), all_sheets[0])
             sheet_domains = next((s for s in all_sheets if 'source' in s.lower() or 'domain' in s.lower()), all_sheets[1] if len(all_sheets)>1 else all_sheets[0])
             
             df_rules = pd.read_excel(uploaded_file, sheet_name=sheet_rules)
             df_domains = pd.read_excel(uploaded_file, sheet_name=sheet_domains)
             
+            # --- Extract API Key from 3rd Sheet (if exists) ---
+            excel_api_key = ""
+            if len(all_sheets) >= 3:
+                api_sheet = next((s for s in all_sheets if 'api' in s.lower()), None)
+                if not api_sheet:
+                    remaining_sheets = [s for s in all_sheets if s not in (sheet_rules, sheet_domains)]
+                    if remaining_sheets:
+                        api_sheet = remaining_sheets[0]
+                
+                if api_sheet:
+                    df_api = pd.read_excel(uploaded_file, sheet_name=api_sheet)
+                    # Search for something that looks like an API key in the sheet
+                    for col in df_api.columns:
+                        for val in df_api[col].dropna():
+                            if isinstance(val, str) and len(val.strip()) > 25: 
+                                excel_api_key = val.strip()
+                                break
+                        if excel_api_key:
+                            break
+            
+            # Prioritize Excel API Key over UI input
+            final_api_key = excel_api_key if excel_api_key else ui_api_key
+            
+            # Prep data for merge
             df_rules.columns = df_rules.columns.str.strip()
             df_domains.columns = df_domains.columns.str.strip()
             common_col = list(set(df_rules.columns) & set(df_domains.columns))[0]
@@ -252,7 +327,12 @@ if uploaded_file:
                 src = row[source_col]
                 if pd.isna(src) or str(src).strip() == "" or str(src).lower() == "nan":
                     continue
-                tasks.append({'src': src, 'tgt': row[target_col], 'api_key': google_api_key})
+                tasks.append({
+                    'src': src, 
+                    'tgt': row[target_col], 
+                    'api_key': final_api_key,
+                    'max_retries': max_retries_input
+                })
             
             total_tasks = len(tasks)
             results = []
@@ -280,7 +360,9 @@ if uploaded_file:
                 def color_status(val):
                     if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
                     if 'NOT SECURE' in str(val): return 'background-color: #ffedd5; color: #c2410c; font-weight: bold'
-                    if 'DANGEROUS' in str(val): return 'background-color: #4c1d95; color: #ffffff; font-weight: bold'
+                    # All Safe Browsing Threat Types get the purple highlighting
+                    if 'DECEPTIVE' in str(val) or 'HARMFUL' in str(val) or 'DANGEROUS' in str(val): 
+                        return 'background-color: #4c1d95; color: #ffffff; font-weight: bold'
                     return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
 
                 st.subheader("Results Table")
