@@ -139,13 +139,8 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
         
         core_actual = clean_url_logic(final_url)
 
-        # --- BLANK PAGE REDIRECTION LOGIC (Domain just goes to itself) ---
-        if core_expected != core_source and core_actual == core_source:
-            result["Status"] = "❌ MISMATCH"
-            result["Details"] = "Blank page redirection"
-            return result
-
-        # --- GOOGLE SAFE BROWSING CHECK ---
+        # --- PRIORITY 1: GOOGLE SAFE BROWSING CHECK ---
+        # We check this FIRST before any blank page logic to ensure danger is always flagged
         if google_api_key:
             threat_type = check_safe_browsing(final_url, google_api_key)
             if threat_type:
@@ -161,8 +156,14 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
                 
                 result["Page Output"] = f"Site blocked by Google. Threat type identified: {threat_type}"
                 return result
+
+        # --- PRIORITY 2: BLANK PAGE REDIRECTION LOGIC (Domain just goes to itself) ---
+        if core_expected != core_source and core_actual == core_source:
+            result["Status"] = "❌ MISMATCH"
+            result["Details"] = "Blank page redirection"
+            return result
                 
-        # --- STANDARD COMPARISON LOGIC ---
+        # --- PRIORITY 3: STANDARD COMPARISON LOGIC ---
         if core_expected == core_actual:
             result["Status"] = "✅ MATCH"
             result["Details"] = "OK"
