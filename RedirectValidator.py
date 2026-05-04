@@ -27,26 +27,18 @@ def safe_extract_text(response):
     except:
         return "No readable content"
 
-def find_column(df, keywords, fallback_index=0):
-    for c in df.columns:
-        if any(k in c.lower() for k in keywords):
-            return c
-    return df.columns[fallback_index]
-
 def classify_ssl_error(e):
     msg = str(e).lower()
     if "expired" in msg:
         return "🔒 SSL EXPIRED", "Certificate expired"
-    if "hostname" in msg or "doesn't match" in msg:
+    if "hostname" in msg:
         return "⚠️ SSL MISMATCH", "Domain mismatch"
     if "self signed" in msg:
-        return "⚠️ SELF SIGNED", "Self-signed certificate"
-    if "verify failed" in msg:
-        return "🔒 SSL FAILED", "Verification failed"
-    return "🔒 NOT SECURE", "Unknown SSL issue"
+        return "⚠️ SELF SIGNED", "Self signed"
+    return "🔒 NOT SECURE", "SSL issue"
 
-def make_request(url, max_retries):
-    if not str(url).startswith(('http://', 'https://')):
+def make_request(url, retries):
+    if not str(url).startswith(('http://','https://')):
         url = 'http://' + str(url)
 
     headers = {
@@ -56,7 +48,7 @@ def make_request(url, max_retries):
     }
 
     last_err = None
-    for _ in range(max_retries):
+    for _ in range(retries):
         try:
             return requests.get(url, headers=headers, timeout=10, allow_redirects=True)
         except requests.exceptions.SSLError as e:
@@ -65,7 +57,7 @@ def make_request(url, max_retries):
             last_err = e
             time.sleep(1)
 
-    raise requests.exceptions.ConnectionError("All retries failed")
+    raise requests.exceptions.ConnectionError("Connection failed after retries")
 
 def check_safe_browsing(url, api_key):
     if not api_key:
@@ -104,7 +96,7 @@ def check_redirect(source, expected, api_key=None, retries=3):
     core_source = clean_url_logic(source)
     core_expected = clean_url_logic(expected)
 
-    # 1. Dangerous (priority)
+    # 1. Dangerous priority
     threat = check_safe_browsing(source, api_key)
     if threat:
         result["Status"] = "🚨 DANGEROUS"
@@ -116,11 +108,10 @@ def check_redirect(source, expected, api_key=None, retries=3):
         final_url = response.url
         result["Actual Final URL"] = final_url
 
-        # content
-        if 'text/html' in response.headers.get('Content-Type', '').lower():
+        if 'text/html' in response.headers.get('Content-Type','').lower():
             result["Page Output"] = safe_extract_text(response)
         else:
-            result["Page Output"] = "Non-HTML content"
+            result["Page Output"] = "Non-HTML"
 
         core_actual = clean_url_logic(final_url)
 
@@ -131,7 +122,7 @@ def check_redirect(source, expected, api_key=None, retries=3):
             result["Details"] = threat
             return result
 
-        # 3. Blank/self redirect logic
+        # 3. Blank/self redirect
         if core_actual == core_source:
             if core_expected == core_source:
                 result["Status"] = "✅ MATCH"
@@ -141,7 +132,7 @@ def check_redirect(source, expected, api_key=None, retries=3):
                 result["Details"] = "Blank/self redirect"
             return result
 
-        # 4. Normal logic
+        # 4. Normal match logic
         if core_expected == core_actual:
             result["Status"] = "✅ MATCH"
         elif core_expected in core_actual:
@@ -162,7 +153,7 @@ def check_redirect(source, expected, api_key=None, retries=3):
 
     except requests.exceptions.ConnectionError:
         result["Status"] = "🚫 DOWN"
-        result["Details"] = "Connection failed"
+        result["Details"] = "Server not reachable"
 
     except requests.exceptions.Timeout:
         result["Status"] = "⏱️ TIMEOUT"
@@ -193,12 +184,14 @@ def convert_df_to_excel(df):
 
     return buffer.getvalue()
 
+# ---------------- SAMPLE ---------------- #
+
 def generate_sample_file():
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame({'Feed Name': ['Sample'], 'Target Website': ['example.com']}).to_excel(writer, sheet_name='Target_Rules', index=False)
-        pd.DataFrame({'Feed Name': ['Sample'], 'Source Domain': ['test.com']}).to_excel(writer, sheet_name='Source_Domains', index=False)
-        pd.DataFrame({'Google Safe Browsing API Key': ['PASTE_KEY_HERE']}).to_excel(writer, sheet_name='API_Settings', index=False)
+        pd.DataFrame({'Feed Name':['Sample'],'Target Website':['example.com']}).to_excel(writer, sheet_name='Target_Rules', index=False)
+        pd.DataFrame({'Feed Name':['Sample'],'Source Domain':['test.com']}).to_excel(writer, sheet_name='Source_Domains', index=False)
+        pd.DataFrame({'Google Safe Browsing API Key':['PASTE_KEY_HERE']}).to_excel(writer, sheet_name='API_Settings', index=False)
     return output.getvalue()
 
 # ---------------- UI ---------------- #
@@ -208,7 +201,7 @@ st.title("Redirect Validator 🚀")
 with st.sidebar:
     st.download_button("📥 Download Template", generate_sample_file(), "template.xlsx")
     max_retries = st.number_input("Max Retries", 1, 10, 3)
-    api_key = st.text_input("API Key (Optional)", type="password")
+    ui_api_key = st.text_input("API Key (Optional)", type="password")
 
 file = st.file_uploader("Upload Excel", type=["xlsx"])
 
@@ -229,25 +222,33 @@ if file:
 
         common = list(set(df_rules.columns) & set(df_domains.columns))[0]
 
-        df_rules = df_rules.drop_duplicates(subset=[common])
-        df_domains = df_domains.drop_duplicates(subset=[common])
+        # API KEY priority
+        excel_api_key = ""
+        if len(sheets) >= 3:
+            df_api = pd.read_excel(file, sheet_name=sheets[2])
+            for col in df_api.columns:
+                for val in df_api[col].dropna():
+                    if isinstance(val,str) and len(val.strip())>20:
+                        excel_api_key = val.strip()
 
-        merged = pd.merge(df_domains, df_rules, on=common, how='left')
+        final_api_key = excel_api_key if excel_api_key else ui_api_key
 
-        source_col = find_column(df_domains, ['source','domain'])
-        target_col = find_column(df_rules, ['target','web'])
+        # -------- TASKS FIX (NO MERGE ISSUE) -------- #
+        tasks = []
+        for _, row in df_domains.iterrows():
+            src = row[find_col := next((c for c in df_domains.columns if 'source' in c.lower() or 'domain' in c.lower()), df_domains.columns[0])]
+            match = df_rules[df_rules[common] == row[common]]
 
-        tasks = [(row[source_col], row[target_col]) for _, row in merged.iterrows() if not pd.isna(row[source_col])]
+            tgt = match.iloc[0][next((c for c in df_rules.columns if 'target' in c.lower() or 'web' in c.lower()), df_rules.columns[1])] if not match.empty else None
 
-        # dedupe tasks
-        seen = set()
-        tasks = [(s,t) for s,t in tasks if not (str(s).lower() in seen or seen.add(str(s).lower()))]
+            if pd.notna(src):
+                tasks.append((src, tgt))
 
         results = []
         total = len(tasks)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
-            futures = [ex.submit(check_redirect, s, t, api_key, max_retries) for s,t in tasks]
+            futures = [ex.submit(check_redirect, s, t, final_api_key, max_retries) for s,t in tasks]
 
             for i, f in enumerate(concurrent.futures.as_completed(futures)):
                 results.append(f.result())
@@ -258,11 +259,11 @@ if file:
 
         df_res = pd.DataFrame(results)
 
-        # reorder columns
+        # reorder
         cols = ["Source Domain","Status"] + [c for c in df_res.columns if c not in ["Source Domain","Status"]]
         df_res = df_res[cols]
 
-        # hide page output
+        # hide Page Output
         display_df = df_res.drop(columns=["Page Output"], errors="ignore")
 
         st.dataframe(display_df, use_container_width=True)
