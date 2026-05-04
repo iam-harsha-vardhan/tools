@@ -186,9 +186,26 @@ def to_excel(df):
 
 def sample():
     out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as w:
-        pd.DataFrame({'Feed Name':['A'],'Target Website':['example.com']}).to_excel(w,"Target_Rules",index=False)
-        pd.DataFrame({'Feed Name':['A'],'Source Domain':['test.com']}).to_excel(w,"Source_Domains",index=False)
+
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        df1 = pd.DataFrame({
+            'Feed Name': ['Sample'],
+            'Target Website': ['example.com']
+        })
+        df2 = pd.DataFrame({
+            'Feed Name': ['Sample'],
+            'Source Domain': ['test.com']
+        })
+
+        df1.to_excel(writer, sheet_name="Target_Rules", index=False)
+        df2.to_excel(writer, sheet_name="Source_Domains", index=False)
+
+        # 🔥 CRITICAL FIX → ensure at least one active sheet
+        writer.book.active = 0
+
+    # 🔥 ALSO IMPORTANT → reset buffer pointer
+    out.seek(0)
+
     return out.getvalue()
 
 # ---------------- UI ---------------- #
