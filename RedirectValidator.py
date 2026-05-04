@@ -9,64 +9,44 @@ import re
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- Page Config ---
 st.set_page_config(page_title="Redirect Validator", page_icon="🔗", layout="wide")
-
-# --- Custom CSS ---
-st.markdown("""
-<style>
-html, body, [class*="css"] { font-family: 'Inter', 'Segoe UI', sans-serif; }
-.stButton > button {
-    border-radius: 8px !important;
-    font-weight: 600 !important;
-    height: 3em;
-    width: 100%;
-}
-</style>
-""", unsafe_allow_html=True)
 
 # ---------------- HELPERS ---------------- #
 
-def clean_url_logic(url):
+def clean_url(url):
     if not url or pd.isna(url): return ""
     u = str(url).strip().lower()
-    if u.startswith("https://"): u = u[8:]
-    if u.startswith("http://"): u = u[7:]
-    if u.startswith("www."): u = u[4:]
+    for p in ["https://","http://","www."]:
+        if u.startswith(p): u = u[len(p):]
     return u.rstrip('/')
 
-def safe_extract_text(response):
+def safe_text(res):
     try:
-        return response.content.decode('utf-8', errors='ignore')[:1000]
+        return res.content.decode('utf-8', errors='ignore')[:500]
     except:
-        return "No readable content"
+        return ""
 
-def find_column(df, keywords, fallback_index=0):
+def find_col(df, keys, fallback=0):
     for c in df.columns:
-        if any(k in c.lower() for k in keywords):
+        if any(k in c.lower() for k in keys):
             return c
-    return df.columns[fallback_index]
+    return df.columns[fallback]
 
-def classify_ssl_error(e):
+def classify_ssl(e):
     msg = str(e).lower()
-    if "expired" in msg:
-        return "🔒 SSL EXPIRED", "Certificate expired"
-    if "hostname" in msg or "doesn't match" in msg:
-        return "⚠️ SSL MISMATCH", "Domain mismatch"
-    if "self signed" in msg:
-        return "⚠️ SELF SIGNED", "Self-signed certificate"
-    if "verify failed" in msg:
-        return "🔒 SSL FAILED", "Verification failed"
-    return "🔒 NOT SECURE", "Unknown SSL issue"
+    if "expired" in msg: return "🔒 SSL EXPIRED"
+    if "hostname" in msg: return "⚠️ SSL MISMATCH"
+    if "self signed" in msg: return "⚠️ SELF SIGNED"
+    return "🔒 NOT SECURE"
 
-def make_request(url, retries):
-    if not str(url).startswith(('http://', 'https://')):
-        url = 'http://' + str(url)
+def make_request(url, retries=3, browser=False):
+    if not str(url).startswith(('http://','https://')):
+        url = "http://" + str(url)
 
     headers = {
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'text/html',
-        'Accept-Encoding': 'identity'
+        "User-Agent": "Mozilla/5.0" if browser else "python-requests/2.31",
+        "Accept": "text/html",
+        "Accept-Encoding": "identity"
     }
 
     for _ in range(retries):
@@ -77,129 +57,153 @@ def make_request(url, retries):
         except:
             time.sleep(1)
 
-    raise Exception("Failed after retries")
+    raise requests.exceptions.ConnectionError("Connection failed")
 
-def check_safe_browsing(url, api_key):
-    if not api_key:
-        return None
+# ---------------- CLOAKING ---------------- #
+
+def detect_cloaking(url):
+    try:
+        bot = make_request(url, browser=False)
+        human = make_request(url, browser=True)
+
+        if bot.url != human.url:
+            return True, f"Bot:{bot.url} | Browser:{human.url}"
+
+        if safe_text(bot)[:200] != safe_text(human)[:200]:
+            return True, "Content differs"
+
+    except:
+        pass
+
+    return False, ""
+
+# ---------------- SAFE BROWSING ---------------- #
+
+def safe_browse(url, key):
+    if not key: return None
     try:
         r = requests.post(
-            f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={api_key}",
+            f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={key}",
             json={
-                "client": {"clientId": "app", "clientVersion": "1.0"},
-                "threatInfo": {
-                    "threatTypes": ["MALWARE","SOCIAL_ENGINEERING"],
-                    "platformTypes": ["ANY_PLATFORM"],
-                    "threatEntryTypes": ["URL"],
-                    "threatEntries": [{"url": url}]
+                "client":{"clientId":"app","clientVersion":"1.0"},
+                "threatInfo":{
+                    "threatTypes":["MALWARE","SOCIAL_ENGINEERING"],
+                    "platformTypes":["ANY_PLATFORM"],
+                    "threatEntryTypes":["URL"],
+                    "threatEntries":[{"url":url}]
                 }
             }, timeout=5)
         if "matches" in r.json():
             return r.json()["matches"][0]["threatType"]
-    except:
-        pass
+    except: pass
     return None
 
-def check_redirect(source, target, api_key=None, retries=3):
+# ---------------- CORE ---------------- #
 
-    result = {
+def check(source, target, key, retries):
+
+    res = {
         "Source Domain": source,
-        "Expected Target": target,
-        "Actual Final URL": "-",
         "Status": "",
-        "Details": "",
-        "Page Output": ""
+        "Expected Target": target,
+        "Actual Final URL": "-"
     }
 
-    # Safe browsing
-    threat = check_safe_browsing(source, api_key)
+    core_src = clean_url(source)
+    core_exp = clean_url(target)
+
+    # 1. Dangerous
+    threat = safe_browse(source, key)
     if threat:
-        result["Status"] = "🚨 DANGEROUS"
-        result["Details"] = threat
-        return result
+        res["Status"] = "🚨 DANGEROUS"
+        return res
 
     try:
-        response = make_request(source, retries)
+        r = make_request(source, retries)
+        final = r.url
+        res["Actual Final URL"] = final
+        core_act = clean_url(final)
 
-        result["Actual Final URL"] = response.url
-
-        if 'text/html' in response.headers.get('Content-Type', '').lower():
-            result["Page Output"] = safe_extract_text(response)
-        else:
-            result["Page Output"] = "Non-HTML content"
-
-        threat = check_safe_browsing(response.url, api_key)
+        # 2. Dangerous final
+        threat = safe_browse(final, key)
         if threat:
-            result["Status"] = "🚨 DANGEROUS"
-            result["Details"] = threat
-            return result
+            res["Status"] = "🚨 DANGEROUS"
+            return res
 
-        core_expected = clean_url_logic(target)
-        core_actual = clean_url_logic(response.url)
+        # 3. Cloaking
+        cloaked, detail = detect_cloaking(source)
+        if cloaked:
+            res["Status"] = "⚠️ CLOAKING"
+            return res
 
-        if core_expected == core_actual or core_expected in core_actual:
-            result["Status"] = "✅ MATCH"
+        # 4. Blank/self redirect
+        if core_act == core_src:
+            if core_exp == core_src:
+                res["Status"] = "✅ MATCH"
+            else:
+                res["Status"] = "❌ BLANK"
+            return res
+
+        # 5. Match logic
+        if core_exp == core_act or core_exp in core_act:
+            res["Status"] = "✅ MATCH"
         else:
-            result["Status"] = "❌ MISMATCH"
+            res["Status"] = "❌ MISMATCH"
 
     except requests.exceptions.SSLError as e:
-        status, detail = classify_ssl_error(e)
-        result["Status"] = status
-        result["Details"] = detail
+        res["Status"] = classify_ssl(e)
 
     except requests.exceptions.ConnectionError:
-        result["Status"] = "🚫 DOWN"
+        res["Status"] = "🚫 DOWN"
 
     except requests.exceptions.Timeout:
-        result["Status"] = "⏱️ TIMEOUT"
+        res["Status"] = "⏱️ TIMEOUT"
 
-    except Exception as e:
-        result["Status"] = "❗ ERROR"
-        result["Details"] = str(e)
+    except Exception:
+        res["Status"] = "❗ ERROR"
 
-    return result
+    return res
 
-# -------- Excel Fix -------- #
+# ---------------- EXCEL ---------------- #
 
-def sanitize_for_excel(val):
-    if isinstance(val, str):
-        return re.sub(r'[^\x09\x0A\x0D\x20-\x7E]', '', val)
+def clean_excel(val):
+    if isinstance(val,str):
+        return re.sub(r'[^\x20-\x7E]', '', val)
     return val
 
-def convert_df_to_excel(df):
-    buffer = io.BytesIO()
-    clean_df = df.copy()
+def to_excel(df):
+    buf = io.BytesIO()
+    df = df.copy()
 
-    for col in clean_df.columns:
-        if clean_df[col].dtype == object:
-            clean_df[col] = clean_df[col].astype(str).apply(sanitize_for_excel)
+    for c in df.columns:
+        if df[c].dtype == object:
+            df[c] = df[c].astype(str).apply(clean_excel)
 
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        clean_df.to_excel(writer, index=False)
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        df.to_excel(w, index=False)
 
-    return buffer.getvalue()
+    return buf.getvalue()
 
-def generate_sample_file():
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        pd.DataFrame({'Feed Name': ['Sample'], 'Target Website': ['example.com']}).to_excel(writer, sheet_name='Target_Rules', index=False)
-        pd.DataFrame({'Feed Name': ['Sample'], 'Source Domain': ['test.com']}).to_excel(writer, sheet_name='Source_Domains', index=False)
-        pd.DataFrame({'Google Safe Browsing API Key': ['PASTE_KEY_HERE']}).to_excel(writer, sheet_name='API_Settings', index=False)
-    return output.getvalue()
+def sample():
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        pd.DataFrame({'Feed Name':['A'],'Target Website':['example.com']}).to_excel(w,"Target_Rules",index=False)
+        pd.DataFrame({'Feed Name':['A'],'Source Domain':['test.com']}).to_excel(w,"Source_Domains",index=False)
+    return out.getvalue()
 
 # ---------------- UI ---------------- #
 
 st.title("Redirect Validator 🚀")
 
 with st.sidebar:
-    st.download_button("📥 Download Template", generate_sample_file(), "template.xlsx")
-    max_retries = st.number_input("Max Retries", 1, 10, 3)
-    api_key = st.text_input("API Key", type="password")
+    st.download_button("📥 Template", sample(), "template.xlsx")
+    retries = st.number_input("Retries",1,10,3)
+    api_key = st.text_input("API Key (Optional)", type="password")
 
 file = st.file_uploader("Upload Excel", type=["xlsx"])
 
 if file:
-    if st.button("🚀 Start Validation"):
+    if st.button("🚀 Start"):
 
         progress = st.progress(0)
         status = st.empty()
@@ -207,39 +211,46 @@ if file:
         xls = pd.ExcelFile(file)
         sheets = xls.sheet_names
 
-        df_rules = pd.read_excel(file, sheet_name=sheets[0])
-        df_domains = pd.read_excel(file, sheet_name=sheets[1] if len(sheets)>1 else sheets[0])
+        df_rules = pd.read_excel(file, sheets[0])
+        df_domains = pd.read_excel(file, sheets[1] if len(sheets)>1 else sheets[0])
 
         df_rules.columns = df_rules.columns.str.strip()
         df_domains.columns = df_domains.columns.str.strip()
 
-        common = list(set(df_rules.columns) & set(df_domains.columns))[0]
-        merged = pd.merge(df_domains, df_rules, on=common, how='left')
+        common = list(set(df_rules.columns)&set(df_domains.columns))[0]
 
-        source_col = find_column(df_domains, ['source','domain'])
-        target_col = find_column(df_rules, ['target','web'])
+        df_rules = df_rules.drop_duplicates(subset=[common])
+        df_domains = df_domains.drop_duplicates(subset=[common])
 
-        tasks = [
-            (row[source_col], row[target_col])
-            for _, row in merged.iterrows()
-            if not pd.isna(row[source_col])
-        ]
+        merged = pd.merge(df_domains, df_rules, on=common, how="left")
 
-        results = []
-        total = len(tasks)
+        src_col = find_col(df_domains,["source","domain"])
+        tgt_col = find_col(df_rules,["target","web"])
+
+        tasks = [(r[src_col], r[tgt_col]) for _,r in merged.iterrows() if pd.notna(r[src_col])]
+
+        # dedupe
+        seen=set()
+        tasks=[t for t in tasks if not (t[0] in seen or seen.add(t[0]))]
+
+        total=len(tasks)
+        results=[]
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
-            futures = [ex.submit(check_redirect, s, t, api_key, max_retries) for s,t in tasks]
+            futures=[ex.submit(check,s,t,api_key,retries) for s,t in tasks]
 
-            for i, f in enumerate(concurrent.futures.as_completed(futures)):
+            for i,f in enumerate(concurrent.futures.as_completed(futures)):
                 results.append(f.result())
                 progress.progress((i+1)/total)
-                status.markdown(f"**⚡ Progress:** {i+1}/{total}")
+                status.markdown(f"⚡ {i+1}/{total}")
 
-        status.success("✅ Completed")
+        status.success("✅ Done")
 
         df_res = pd.DataFrame(results)
 
+        # reorder columns
+        df_res = df_res[["Source Domain","Status","Expected Target","Actual Final URL"]]
+
         st.dataframe(df_res, use_container_width=True)
 
-        st.download_button("📥 Download Report", convert_df_to_excel(df_res), "report.xlsx")
+        st.download_button("📥 Download", to_excel(df_res), "report.xlsx")
