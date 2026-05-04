@@ -51,7 +51,7 @@ def clean_url_logic(url):
     return u.rstrip('/')
 
 def make_request(url, max_retries):
-    """Tries to connect with REAL BROWSER HEADERS, enforcing retries for failed pages."""
+    """Tries to connect with REAL BROWSER HEADERS, enforcing identity encoding."""
     target_url = str(url).strip()
     if not target_url.startswith(('http://', 'https://')):
         target_url = 'http://' + target_url 
@@ -60,7 +60,8 @@ def make_request(url, max_retries):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
+        # CRITICAL: Force 'identity' to prevent compressed binary data from leaking into text
+        'Accept-Encoding': 'identity',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1'
     }
@@ -68,12 +69,11 @@ def make_request(url, max_retries):
     last_err = None
     for attempt in range(max_retries):
         try:
-            # Note: verify=True is now enforced for security. SSL errors will be caught.
             response = requests.get(target_url, headers=headers, allow_redirects=True, timeout=10)
             return response
         except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
             last_err = e
-            time.sleep(1)
+            time.sleep(1) 
             
     try:
         if target_url.startswith("http://"):
@@ -147,8 +147,12 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
         final_url = response.url
         result["Actual Final URL"] = final_url
         
-        # Limit content to 1000 chars to save space/memory
-        page_content = response.text[:1000] if response.text else "No content returned."
+        # CRITICAL FIX: Use response.content.decode to safely ignore binary junk/bad bytes
+        try:
+            page_content = response.content.decode('utf-8', errors='ignore')[:1000]
+        except:
+            page_content = "Unreadable Content"
+            
         result["Page Output"] = page_content
         
         core_actual = clean_url_logic(final_url)
@@ -233,21 +237,21 @@ def process_single_row(row_data):
 
 def sanitize_for_excel(val):
     """
-    STRICT SCRUBBER: Removes all non-printable/illegal ASCII control characters.
-    This prevents the 'cannot be used in worksheets' Excel crash.
+    STRICT SANITIZER: Removes all non-printable/illegal characters that crash openpyxl.
+    Matches the logic: re.sub(r'[^\x09\x0A\x0D\x20-\x7E]', '', x)
     """
     if isinstance(val, str):
-        # Remove ASCII control characters 0-31 (except 9=tab, 10=new line, 13=return)
-        # Also remove high-bit garbage symbols (\x7f-\xff)
-        return re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]', '', val)
+        # Allow Tab, LF, CR, and printable ASCII space to tilde.
+        return re.sub(r'[^\x09\x0A\x0D\x20-\x7E]', '', val)
     return val
 
 def convert_df_to_excel(df):
     buffer = io.BytesIO()
     clean_df = df.copy()
     for col in clean_df.columns:
+        # Force to string then apply the strict sanitizer
         if clean_df[col].dtype == object:
-            clean_df[col] = clean_df[col].apply(sanitize_for_excel)
+            clean_df[col] = clean_df[col].astype(str).apply(sanitize_for_excel)
             
     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
         clean_df.to_excel(writer, index=False)
@@ -330,7 +334,12 @@ if uploaded_file:
                 status_text.success(f"✅ Finished {len(tasks)} domains!")
                 df_res = pd.DataFrame(results)
                 df_res.index = range(1, len(df_res) + 1)
-                df_failed = df_res[~df_res['Status'].str.contains("MATCH")]
+                
+                # Reorder to match your preferred view
+                display_cols = ["Source Domain", "Status", "Expected Target", "Actual Final URL", "Details"]
+                final_df_res = df_res[display_cols + ["Page Output"]]
+                
+                df_failed = final_df_res[~final_df_res['Status'].str.contains("MATCH")]
                 
                 def color_status(val):
                     if 'MATCH' in str(val): return 'background-color: #d1fae5; color: #065f46; font-weight: bold'
@@ -338,7 +347,7 @@ if uploaded_file:
                     return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
 
                 st.subheader("Results")
-                st.dataframe(df_res.style.map(color_status, subset=['Status']), use_container_width=True, height=600, column_config={"Page Output": None})
+                st.dataframe(final_df_res.drop(columns=["Page Output"]).style.map(color_status, subset=['Status']), use_container_width=True, height=600)
                 
                 st.divider()
                 if not df_failed.empty:
@@ -351,7 +360,7 @@ if uploaded_file:
                 st.subheader("Reports")
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.download_button("Full Report", convert_df_to_excel(df_res), "full_report.xlsx", use_container_width=True)
+                    st.download_button("Full Report", convert_df_to_excel(final_df_res), "full_report.xlsx", use_container_width=True)
                 with c2:
                     st.download_button("Failed Only", convert_df_to_excel(df_failed), "failed_report.xlsx", type="primary", use_container_width=True)
         except Exception as e:
