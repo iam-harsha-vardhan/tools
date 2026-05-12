@@ -116,7 +116,7 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
     
     result = {
         "Source Domain": source, "Expected Target": expected_target,
-        "Actual Final URL": "-", "Status": "Checking...", "Details": "", "Page Output": ""
+        "Actual Final URL": "-", "Status": "Checking...", "Details": "", "Error Snippet": "-"
     }
 
     # PRIORITY 0: Pre-check Source with Google Safe Browsing
@@ -126,6 +126,7 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
             status_map = {"SOCIAL_ENGINEERING": "🚨 DECEPTIVE", "MALWARE": "🚨 HARMFUL"}
             result["Status"] = status_map.get(threat, "🚨 DANGEROUS")
             result["Details"] = f"Google Block: {threat}"
+            result["Error Snippet"] = f"Blocked by Google Safe Browsing: {threat}"
             return result
     
     try:
@@ -133,12 +134,14 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
         final_url = response.url
         result["Actual Final URL"] = final_url
         
-        # Safe decode for binary/corrupted responses
+        # Safe decode for binary/corrupted responses (up to 1500 chars)
         try:
-            page_content = response.content.decode('utf-8', errors='ignore')[:2000]
+            page_content = response.content.decode('utf-8', errors='ignore')[:1500]
         except:
-            page_content = "Binary/Unreadable"
-        result["Page Output"] = page_content # Kept internally for Sophos detection
+            page_content = "Binary/Unreadable Content"
+            
+        # Temporarily store the snippet (we will clear it later if it's a normal match/mismatch)
+        result["Error Snippet"] = page_content.strip()
         
         # PRIORITY 1: Enterprise Block Detection (Sophos/Filter)
         block_keywords = ["Sophos", "Website Blocked", "Spam URLs", "Your organization forbids access", "Fortinet", "Cisco Umbrella"]
@@ -147,6 +150,7 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
             category = category_match.group(1).strip() if category_match else "Enterprise Filter"
             result["Status"] = "🚨 BLOCKED"
             result["Details"] = f"Network Block: {category}"
+            # Returns early, keeping the Sophos HTML inside the Error Snippet column
             return result
 
         core_actual = clean_url_logic(final_url)
@@ -157,29 +161,39 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
             if threat:
                 result["Status"] = "🚨 DANGEROUS"
                 result["Details"] = f"Google Destination Warning: {threat}"
+                result["Error Snippet"] = f"Destination blocked by Google Safe Browsing: {threat}"
                 return result
 
         # PRIORITY 3: Redirection Logic
         if core_actual == core_source:
             if core_expected == core_source:
                 result["Status"] = "✅ MATCH"
+                result["Error Snippet"] = "-" # Clear snippet for perfect matches
             else:
                 result["Status"] = "❌ MISMATCH"
                 result["Details"] = "Blank page redirection"
+                result["Error Snippet"] = "-" # Clear snippet, as the page itself loaded fine
             return result
 
         if core_expected == core_actual or core_expected in core_actual:
             result["Status"] = "✅ MATCH"
             result["Details"] = "OK" + (" (SSL Insecure)" if ssl_fallback else "")
+            result["Error Snippet"] = "-" # Clear snippet for matches
         else:
             result["Status"] = "❌ MISMATCH"
             detail = "Wrong destination"
-            if response.status_code >= 400: detail += f" (HTTP {response.status_code})"
+            if response.status_code >= 400: 
+                detail += f" (HTTP {response.status_code})"
+                # Error Snippet remains intact to show the HTTP Error HTML (e.g., 502 Bad Gateway)
+            else:
+                # Clear snippet for standard wrong destination where page loaded successfully
+                result["Error Snippet"] = "-"
             result["Details"] = detail
 
     except Exception as e:
         result["Status"] = "❌ BROKEN"
         result["Details"] = str(e)[:60]
+        result["Error Snippet"] = str(e)[:1500] # Show raw exception/timeout in the snippet column
         
     return result
 
@@ -276,8 +290,8 @@ if st.session_state['results_df'] is not None:
         return 'background-color: #fee2e2; color: #991b1b; font-weight: bold'
 
     st.subheader("Validation Results")
-    # Hide 'Page Output' from UI table
-    st.dataframe(df.drop(columns=["Page Output"]).style.map(color_status, subset=['Status']), use_container_width=True, height=600)
+    # Render the table WITH the "Error Snippet" column explicitly included
+    st.dataframe(df.style.map(color_status, subset=['Status']), use_container_width=True, height=600)
     
     st.divider()
     c1, c2 = st.columns(2)
