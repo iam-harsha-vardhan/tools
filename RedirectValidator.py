@@ -6,6 +6,7 @@ import time
 import urllib3
 import concurrent.futures
 import re
+import html
 from urllib.parse import urlparse
 
 # 1. Hide "Insecure Request" warnings
@@ -55,6 +56,19 @@ def clean_url_logic(url):
     if u.startswith("http://"): u = u[7:]
     if u.startswith("www."): u = u[4:]
     return u.rstrip('/')
+
+def extract_visible_text(html_content):
+    """Converts raw HTML into readable plain text by stripping tags and scripts."""
+    if not isinstance(html_content, str): return ""
+    # Remove scripts and styles
+    text = re.sub(r'<(script|style)[^>]*>.*?</\1>', ' ', html_content, flags=re.IGNORECASE | re.DOTALL)
+    # Remove all other HTML tags
+    text = re.sub(r'<[^>]+>', ' ', text)
+    # Unescape HTML entities (e.g., &amp; -> &)
+    text = html.unescape(text)
+    # Condense multiple spaces and newlines into a single space
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 def make_request(url, max_retries):
     """Aggressive connection logic: Bypasses SSL errors and falls back to HTTP automatically."""
@@ -134,10 +148,13 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
         final_url = response.url
         result["Actual Final URL"] = final_url
         
-        # Safe decode for binary/corrupted responses (up to 1500 chars)
+        # Safe decode for binary/corrupted responses and extract visible text (up to 1500 chars)
         try:
-            page_content = response.content.decode('utf-8', errors='ignore')[:1500]
+            raw_html = response.content.decode('utf-8', errors='ignore')
+            visible_text = extract_visible_text(raw_html)
+            page_content = visible_text[:1500] if visible_text else "No visible text found."
         except:
+            raw_html = ""
             page_content = "Binary/Unreadable Content"
             
         # Temporarily store the snippet (we will clear it later if it's a normal match/mismatch)
@@ -145,12 +162,14 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
         
         # PRIORITY 1: Enterprise Block Detection (Sophos/Filter)
         block_keywords = ["Sophos", "Website Blocked", "Spam URLs", "Your organization forbids access", "Fortinet", "Cisco Umbrella"]
-        if any(kw.lower() in page_content.lower() for kw in block_keywords):
-            category_match = re.search(r"category\s+([^.]+)", page_content, re.IGNORECASE)
+        search_target = raw_html if raw_html else page_content
+        
+        if any(kw.lower() in search_target.lower() for kw in block_keywords):
+            category_match = re.search(r"category\s+([A-Za-z\s]+)", page_content, re.IGNORECASE)
             category = category_match.group(1).strip() if category_match else "Enterprise Filter"
             result["Status"] = "🚨 BLOCKED"
             result["Details"] = f"Network Block: {category}"
-            # Returns early, keeping the Sophos HTML inside the Error Snippet column
+            # Returns early, keeping the visible text inside the Error Snippet column
             return result
 
         core_actual = clean_url_logic(final_url)
@@ -184,7 +203,7 @@ def check_redirect(source, expected_target, google_api_key=None, max_retries=3):
             detail = "Wrong destination"
             if response.status_code >= 400: 
                 detail += f" (HTTP {response.status_code})"
-                # Error Snippet remains intact to show the HTTP Error HTML (e.g., 502 Bad Gateway)
+                # Error Snippet remains intact to show the visible text of the Error page
             else:
                 # Clear snippet for standard wrong destination where page loaded successfully
                 result["Error Snippet"] = "-"
